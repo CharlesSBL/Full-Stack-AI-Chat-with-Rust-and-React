@@ -87,26 +87,25 @@ async fn infer(
     let text = tokio::task::spawn_blocking(move || {
         let backend = &data.backend;
         let model = &data.model;
-        const MAX_NEW_TOKENS: i32 = 256; // Define max generation length
+        
+        // Increased token limit to prevent truncated responses.
+        const MAX_NEW_TOKENS: i32 = 4096;
 
         // 1. Format the conversation history into a single string
         let prompt_str = build_prompt_from_messages(&messages);
 
         // 2. Build context
         let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(4096)) // Increased context for longer histories
+            .with_n_ctx(NonZeroU32::new(4096))
             .with_n_batch(512);
         let mut ctx = model
             .new_context(backend, ctx_params)
             .map_err(|e| format!("Failed to create context: {e:?}"))?;
 
-        // 3. Tokenize the entire formatted prompt
-        //    Use AddBos::Never because our template handles all special tokens.
+        // 3. Tokenize and feed the prompt into the model
         let toks = model
             .str_to_token(&prompt_str, AddBos::Never)
             .map_err(|e| format!("Failed to tokenize prompt: {e:?}"))?;
-
-        // 4. Feed prompt tokens into the model
         let mut batch = LlamaBatch::new(toks.len() + (MAX_NEW_TOKENS as usize), 1);
         let last_idx = toks.len() as i32 - 1;
         for (i, t) in (0_i32..).zip(toks.iter()) {
@@ -114,7 +113,7 @@ async fn infer(
         }
         ctx.decode(&mut batch).map_err(|e| format!("Failed to decode prompt: {e:?}"))?;
 
-        // 5. Generate response tokens
+        // 4. Generate response tokens
         let eos = model.token_eos();
         let mut out = String::new();
         let mut pos = batch.n_tokens();
@@ -122,7 +121,6 @@ async fn infer(
         for _ in 0..MAX_NEW_TOKENS {
             batch.clear();
             
-            // Perform greedy sampling to get the next token
             let logits = ctx.get_logits();
             let next_id = LlamaToken::new(
                 logits
@@ -133,31 +131,49 @@ async fn infer(
                     .unwrap(),
             );
             
-            // Stop generation if we encounter the End-Of-Sequence token
-            if next_id == eos {
-                break;
-            }
+            if next_id == eos { break; }
 
-            // Decode the token to bytes and append to our output string
             let bytes = model.token_to_bytes(next_id, Special::Tokenize)
                 .map_err(|e| format!("Failed to decode token: {e:?}"))?;
             out.push_str(&String::from_utf8_lossy(&bytes));
 
-            // Feed the newly generated token back into the model for the next loop
             batch.add(next_id, pos, &[0], true).unwrap();
             ctx.decode(&mut batch).map_err(|e| format!("Failed to decode next token: {e:?}"))?;
             pos += 1;
         }
-        Ok::<String, String>(out)
+
+        // --- NEW: Parse output, log thoughts, and clean the answer ---
+        let final_answer = match out.rfind("</think>") {
+            Some(end_tag_pos) => {
+                // We found a thought block.
+                // The part including the tag is the thought.
+                let thought_block = &out[..end_tag_pos + "</think>".len()];
+                
+                // The part after the tag is the final answer for the user.
+                let answer_block = &out[end_tag_pos + "</think>".len()..];
+
+                // Log the thought process to the server's console for debugging.
+                println!("\n🤔 ----- MODEL THOUGHT ----- 🤔");
+                println!("{}", thought_block.trim());
+                println!("🤔 ----- END THOUGHT ----- 🤔\n");
+                
+                // Return the cleaned answer, removing any leading whitespace.
+                answer_block.trim_start().to_string()
+            }
+            None => {
+                // No think block was found, so the entire output is the answer.
+                out
+            }
+        };
+
+        Ok::<String, String>(final_answer)
     })
     .await
-    .unwrap() // Propagate panics from the blocking task
-    .map_err(error::ErrorInternalServerError)?; // Map our String error to a 500 response
+    .unwrap() // Propagate panics
+    .map_err(error::ErrorInternalServerError)?; // Map String error to 500
 
     Ok(HttpResponse::Ok().json(InferResp { generated_text: text }))
 }
-
-
 /* ---------- main ---------- */
 #[actix_web::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -170,7 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let model = LlamaModel::load_from_file(
         &backend,
-        "C:\\Users\\karls\\Documents\\Code\\java\\chat\\rust_chat_client\\models\\Qwen3-0.6B-Q8_0.gguf",
+        "C:\\Users\\karls\\Documents\\Code\\java\\chat\\ai_api\\models\\Qwen3-0.6B-Q8_0.gguf",
         &model_params,
     )?;
     let model = Arc::new(model);
